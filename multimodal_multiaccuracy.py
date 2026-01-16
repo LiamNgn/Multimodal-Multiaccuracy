@@ -3,66 +3,52 @@ import gpytorch
 import pandas as pd
 import numpy as np
 import os
+import random
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score,balanced_accuracy_score, roc_auc_score, brier_score_loss
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier
-from utils import compute_ece,compute_site_leakage
-import random
+from utils import compute_ece  # Ensure utils.py exists or paste compute_ece here
 
-def set_global_seed(seed=42):
-    """
-    Locks all sources of randomness for reproducible results.
-    """
-    # 1. Python standard library
+# --- 0. Reproducibility Engine ---
+def set_global_seed(seed):
+    """Locks all sources of randomness for reproducible results."""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    # 2. NumPy
     np.random.seed(seed)
-    
-    # 3. PyTorch
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # For multi-GPU
-    
-    # 4. Force Deterministic Algorithms (Slower but reproducible)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    print(f"🔒 Global Seed set to {seed}. Results will be reproducible.")
+    # print(f"🔒 Global Seed set to {seed}")
 
 # --- 1. Multimodal Feature Extractor ---
 class MultimodalEncoder(torch.nn.Module):
     def __init__(self, fmri_dim, clinical_dim):
         super(MultimodalEncoder, self).__init__()
-        
         # Path A: Brain Scan (High Dimensional)
         self.fmri_net = torch.nn.Sequential(
             torch.nn.Linear(fmri_dim, 64),
             torch.nn.ReLU(),
             torch.nn.Dropout(0.3)
         )
-        
-        # Path B: Clinical Data (Low Dimensional: Age, Sex, IQ)
+        # Path B: Clinical Data (Low Dimensional)
         self.clinical_net = torch.nn.Sequential(
             torch.nn.Linear(clinical_dim, 16),
             torch.nn.ReLU()
         )
-        
-        # Path C: Fusion Layer (Concatenate A + B)
-        # 64 (brain) + 16 (clinical) = 80
+        # Path C: Fusion
         self.fusion_net = torch.nn.Sequential(
             torch.nn.Linear(80, 32),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, 2) # Latent Z
+            torch.nn.Linear(32, 2)
         )
 
     def forward(self, x_fmri, x_clin):
         h_brain = self.fmri_net(x_fmri)
         h_clin = self.clinical_net(x_clin)
-        # Concatenate
         combined = torch.cat([h_brain, h_clin], dim=1)
         z = self.fusion_net(combined)
         return z
@@ -81,21 +67,11 @@ class GPModel(gpytorch.models.ApproximateGP):
     def forward(self, z):
         return gpytorch.distributions.MultivariateNormal(self.mean_module(z), self.covar_module(z))
 
-# --- 3. The Multiaccuracy Penalty (In-Processing) ---
+# --- 3. The Multiaccuracy Penalty ---
 def multiaccuracy_penalty(residuals, sensitive_attributes):
-    """
-    Calculates r^T * K_audit * r
-    Ensures residuals are orthogonal to the sensitive subgroups.
-    """
-    # Create a Kernel Matrix for the Sensitive Attribute (Site)
-    # If site is discrete, this acts like a group-match matrix
     s = sensitive_attributes.float().unsqueeze(1)
-    dist = torch.cdist(s, s) # Distance matrix
-    # RBF Kernel on Site: 1 if same site, <1 if different
+    dist = torch.cdist(s, s) 
     K_audit = torch.exp(-dist) 
-    
-    # The Penalty: Projections of residuals onto the audit kernel
-    # Normalized by N^2 to keep it scale-invariant
     penalty = (residuals.unsqueeze(0) @ K_audit @ residuals.unsqueeze(1)) / (residuals.numel()**2)
     return penalty.squeeze()
 
@@ -103,8 +79,8 @@ def multiaccuracy_penalty(residuals, sensitive_attributes):
 def train_and_evaluate(data, use_penalty=False):
     (X_fmri_tr, X_clin_tr, y_tr, s_tr), (X_fmri_te, X_clin_te, y_te, s_te) = data
     
-    # Initialize Models (Same as before)
     encoder = MultimodalEncoder(fmri_dim=X_fmri_tr.shape[1], clinical_dim=X_clin_tr.shape[1])
+    # Init GP with first 50 points as inducing
     dummy_z = encoder(X_fmri_tr[:50], X_clin_tr[:50]).detach()
     gp = GPModel(inducing_points=dummy_z)
     likelihood = gpytorch.likelihoods.GaussianLikelihood()
@@ -117,11 +93,10 @@ def train_and_evaluate(data, use_penalty=False):
 
     mll = gpytorch.mlls.VariationalELBO(likelihood, gp, num_data=y_tr.size(0))
     
-    # --- TRAINING LOOP ---
+    # Training
     encoder.train(); gp.train(); likelihood.train()
-    print(f"   Training {'[MULTIMODAL FAIR]' if use_penalty else '[MULTIMODAL BASELINE]'}...")
     
-    for i in range(250): # Keeping your epoch count
+    for i in range(250): 
         optimizer.zero_grad()
         z = encoder(X_fmri_tr, X_clin_tr)
         output = gp(z)
@@ -137,28 +112,25 @@ def train_and_evaluate(data, use_penalty=False):
         loss.backward()
         optimizer.step()
     
-    # --- SOPHISTICATED EVALUATION ---
+    # Evaluation
     encoder.eval(); gp.eval(); likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         z_te = encoder(X_fmri_te, X_clin_te)
-        # Get probabilities (mean of the GP posterior passed through sigmoid/likelihood)
         preds = likelihood(gp(z_te)).mean
         
-        # Convert to numpy for sklearn
         probs_np = preds.numpy()
         y_te_np = y_te.numpy()
         s_te_np = s_te.numpy()
         pred_class = (probs_np > 0.5).astype(int)
 
-        # 1. Utility Metrics
+        # Metrics
         acc = accuracy_score(y_te_np, pred_class)
         b_acc = balanced_accuracy_score(y_te_np, pred_class)
-        try:
-            auroc = roc_auc_score(y_te_np, probs_np)
-        except: auroc = 0.5 # Handle edge case
+        try: auroc = roc_auc_score(y_te_np, probs_np)
+        except: auroc = 0.5 
         ece = compute_ece(probs_np, y_te_np)
 
-        # 2. Fairness Audit (Weighted Bias)
+        # Weighted Bias Calculation
         unique_sites = np.unique(s_te_np)
         site_residuals = []
         site_counts = []
@@ -167,23 +139,19 @@ def train_and_evaluate(data, use_penalty=False):
             mask = (s_te_np == site_code)
             n_g = np.sum(mask)
             if n_g > 0:
-                # Bias = Mean Signed Residual (Actual - Pred)
-                # We take ABS value because we care about magnitude of error
                 bias_g = np.abs(np.mean(y_te_np[mask] - probs_np[mask]))
                 site_residuals.append(bias_g)
                 site_counts.append(n_g)
         
-        # Calculate Weighted Average Bias
         total_N = np.sum(site_counts)
         weighted_bias = np.sum(np.array(site_residuals) * np.array(site_counts)) / total_N
         max_bias = np.max(site_residuals)
 
-        # 3. Leakage Probe
+        # Leakage
         emb = z_te.numpy()
         probe = RandomForestClassifier(n_estimators=50, max_depth=5).fit(emb, s_te_np)
         leakage = probe.score(emb, s_te_np)
         
-        # Return Dictionary
         return {
             "Accuracy": acc,
             "Balanced_Acc": b_acc,
@@ -194,79 +162,116 @@ def train_and_evaluate(data, use_penalty=False):
             "Weighted_Bias": weighted_bias
         }
 
-def run_multimodal_sprint():
-    # Load Data
+# --- 5. The Scientific Execution Loop ---
+def run_scientific_validation():
+    # 5 Seeds for Robustness
+    seeds = [11, 732, 12, 1412, 5512]
+    
+    # Storage for results
+    history = {
+        "Baseline": {"Acc": [], "Bias": [], "ECE": [], "Leakage": []},
+        "Fairness": {"Acc": [], "Bias": [], "ECE": [], "Leakage": []}
+    }
+    
     src_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(src_dir)
     data_path = os.path.join(project_root, "data", "processed", "abide_features.csv")
-    if not os.path.exists(data_path): return
-    df = pd.read_csv(data_path)
-    
-    # --- PREPARE MULTIMODAL DATA ---
-    print("--- 1. Fusing Brain + Clinical Data ---")
-    
-    # Modality A: fMRI Features
-    ignore_cols = ['SUB_ID', 'SITE_ID', 'DX_GROUP', 'nifti_path', 'Unnamed: 0', 'func_preproc']
-    # We remove the clinical cols from X_fmri specifically
-    clinical_cols = ['AGE_AT_SCAN', 'SEX', 'FIQ', 'VIQ', 'PIQ'] 
-    
-    X_fmri_raw = df.drop(columns=ignore_cols + clinical_cols, errors='ignore').select_dtypes(include=[np.number])
-    X_fmri = StandardScaler().fit_transform(SimpleImputer(strategy='constant', fill_value=0).fit_transform(X_fmri_raw))
-    
-    # Modality B: Clinical Features (Age, Sex, IQ)
-    # Note: 'SEX' is usually 1=Male, 2=Female in ABIDE. 'FIQ' is Full IQ.
-    # We must handle NaNs carefully here (IQ is often missing).
-    clin_df = df[['AGE_AT_SCAN', 'SEX', 'FIQ']].copy() # Using FIQ (Full IQ)
-    
-    # Simple imputation for missing IQ (mean fill)
-    clin_imputer = SimpleImputer(strategy='mean')
-    X_clin = StandardScaler().fit_transform(clin_imputer.fit_transform(clin_df))
-    
-    # Targets
-    y = (df['DX_GROUP'].values == 1).astype(float)
-    s = LabelEncoder().fit_transform(df['SITE_ID'])
-    
-    # Split
-    inds = np.arange(len(df))
-    train_idx, test_idx = train_test_split(inds, test_size=0.3, stratify=s, random_state=42)
-    
-    # Package into Tensors
-    def to_tens(idx):
-        return (torch.tensor(X_fmri[idx]).float(), 
-                torch.tensor(X_clin[idx]).float(), 
-                torch.tensor(y[idx]).float(), 
-                torch.tensor(s[idx]).float())
-    
-    train_data = to_tens(train_idx)
-    test_data = to_tens(test_idx)
-    
-    print(f"Data Ready: {len(train_idx)} Train, {len(test_idx)} Test")
-    print(f"Features: {X_fmri.shape[1]} fMRI + {X_clin.shape[1]} Clinical")
-    # Run Experiments
-    res_base = train_and_evaluate((train_data, test_data), use_penalty=False)
-    res_fair = train_and_evaluate((train_data, test_data), use_penalty=True)
+    if not os.path.exists(data_path):
+        print(f"Data not found at {data_path}")
+        return
 
-    print("\n" + "="*60)
-    print(f"{'METRIC':<20} | {'BASELINE':<15} | {'FAIR (OURS)':<15}")
+    print(f"\n Starting loop (N={len(seeds)})")
     print("="*60)
-    print(f"{'Accuracy':<20} | {res_base['Accuracy']:.1%}          | {res_fair['Accuracy']:.1%}")
-    print(f"{'Balanced Acc':<20} | {res_base['Balanced_Acc']:.1%}          | {res_fair['Balanced_Acc']:.1%}")
-    print(f"{'AUROC':<20} | {res_base['AUROC']:.3f}           | {res_fair['AUROC']:.3f}")
-    print("-" * 60)
-    print(f"{'ECE (Uncertainty)':<20} | {res_base['ECE']:.3f}           | {res_fair['ECE']:.3f}  <-- Lower is better")
-    print(f"{'Site Leakage':<20} | {res_base['Leakage']:.1%}          | {res_fair['Leakage']:.1%}  <-- Lower is better")
-    print("-" * 60)
-    print(f"{'Weighted Bias':<20} | {res_base['Weighted_Bias']:.3f}           | {res_fair['Weighted_Bias']:.3f}  <-- MAIN TARGET")
-    print("="*60)
-    
-    if res_fair['Weighted_Bias'] < res_base['Weighted_Bias']:
-        print("✅ SUCCESS: Multiaccuracy penalty reduced the Weighted Bias.")
-    else:
-        print("⚠️ WARNING: Penalty did not reduce bias. Try increasing lambda (25.0).")
 
-    return {
-        "Baseline": res_base,
-        "Fairness": res_fair
-    }
+    for i, seed in enumerate(seeds):
+        print(f"   ► Run {i+1}/{len(seeds)} (Seed {seed})...", end="", flush=True)
+        
+        # 1. Lock Seed
+        set_global_seed(seed)
+        
+        # 2. Reload & Re-split Data (Cross-Validation Style)
+        # Note: We reload df inside loop or just split inside. 
+        # Loading CSV is fast enough for ABIDE.
+        df = pd.read_csv(data_path)
+        
+        ignore_cols = ['SUB_ID', 'SITE_ID', 'DX_GROUP', 'nifti_path', 'Unnamed: 0', 'func_preproc']
+        clinical_cols = ['AGE_AT_SCAN', 'SEX', 'FIQ', 'VIQ', 'PIQ'] 
+        
+        X_fmri_raw = df.drop(columns=ignore_cols + clinical_cols, errors='ignore').select_dtypes(include=[np.number])
+        X_fmri = StandardScaler().fit_transform(SimpleImputer(strategy='constant', fill_value=0).fit_transform(X_fmri_raw))
+        
+        clin_df = df[['AGE_AT_SCAN', 'SEX', 'FIQ']].copy()
+        clin_imputer = SimpleImputer(strategy='mean')
+        X_clin = StandardScaler().fit_transform(clin_imputer.fit_transform(clin_df))
+        
+        y = (df['DX_GROUP'].values == 1).astype(float)
+        s = LabelEncoder().fit_transform(df['SITE_ID'])
+        
+        # Split using the CURRENT SEED
+        inds = np.arange(len(df))
+        train_idx, test_idx = train_test_split(inds, test_size=0.3, stratify=s, random_state=seed)
+        
+        def to_tens(idx):
+            return (torch.tensor(X_fmri[idx]).float(), 
+                    torch.tensor(X_clin[idx]).float(), 
+                    torch.tensor(y[idx]).float(), 
+                    torch.tensor(s[idx]).float())
+        
+        train_data = to_tens(train_idx)
+        test_data = to_tens(test_idx)
+
+        # 3. Train Both Models
+        res_base = train_and_evaluate((train_data, test_data), use_penalty=False)
+        res_fair = train_and_evaluate((train_data, test_data), use_penalty=True)
+        
+        # 4. Log
+        history["Baseline"]["Acc"].append(res_base["Accuracy"])
+        history["Baseline"]["Bias"].append(res_base["Weighted_Bias"])
+        history["Baseline"]["ECE"].append(res_base["ECE"])
+        history["Baseline"]["Leakage"].append(res_base["Leakage"])
+        
+        history["Fairness"]["Acc"].append(res_fair["Accuracy"])
+        history["Fairness"]["Bias"].append(res_fair["Weighted_Bias"])
+        history["Fairness"]["ECE"].append(res_fair["ECE"])
+        history["Fairness"]["Leakage"].append(res_fair["Leakage"])
+        
+        print(" Done.")
+
+    # --- FINAL REPORT GENERATION ---
+    print("\n" + "="*75)
+    print("FINAL PUBLICATION TABLE (Mean ± Std Dev)")
+    print("="*75)
+    
+    metrics = ["Acc", "Bias", "ECE", "Leakage"]
+    print(f"{'METRIC':<10} | {'BASELINE':<28} | {'FAIR (OURS)':<28}")
+    print("-" * 75)
+    
+    summary = {}
+    
+    for m in metrics:
+        b_mean = np.mean(history["Baseline"][m])
+        b_std  = np.std(history["Baseline"][m])
+        
+        f_mean = np.mean(history["Fairness"][m])
+        f_std  = np.std(history["Fairness"][m])
+        
+        # Format
+        b_str = f"{b_mean:.3f} ± {b_std:.3f}"
+        f_str = f"{f_mean:.3f} ± {f_std:.3f}"
+        
+        sig = ""
+        # If bias reduced significantly
+        if m == "Bias" and (b_mean - b_std > f_mean + f_std):
+            sig = "(*)"
+        
+        print(f"{m:<10} | {b_str:<28} | {f_str:<28} {sig}")
+        
+        summary[m] = {"Baseline": f_str, "Fairness": f_str}
+
+    print("="*75)
+    
+    # Return structure for Notebook
+    return history
+
 if __name__ == "__main__":
-    run_multimodal_sprint()
+    run_scientific_validation()
